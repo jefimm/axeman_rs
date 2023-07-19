@@ -51,8 +51,7 @@ pub fn handle_download(args: &Cli) -> anyhow::Result<()> {
         return Ok(());
     }
     let Some(filter) = &args.ctl_url else {
-        // TODO: Is this ok?
-        return Ok(())
+        bail!("No log filter provided ")
     };
     let to_retrieve = ct_log::find_exactly_one_ct_log(&ct_logs, filter)?;
     download_log(to_retrieve, args)
@@ -64,7 +63,7 @@ fn download_log(to_retrieve: &Log, args: &Cli) -> anyhow::Result<()> {
     let tree_size = log_info?.tree_size;
 
     if args.ctl_offset > tree_size {
-        anyhow::bail!("Offset bigger than log size");
+        bail!("Offset bigger than log size");
     }
     download_log_until(&to_retrieve.url, tree_size, args, &client)?;
     if let Some(save_max_idx_file) = &args.save_max_idx_file {
@@ -173,8 +172,9 @@ fn process_block(
         .entries
         .iter()
         .filter_map(|entry| {
+            let s = to_csv_string(log_url, idx, entry, filter_domains);
             idx += 1;
-            to_csv_string(log_url, idx, entry, filter_domains)
+            s
         })
         .collect();
     if file_content.is_empty() {
