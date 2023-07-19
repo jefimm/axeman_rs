@@ -1,5 +1,6 @@
-use serde::{Serialize, Deserialize};
 use chrono::{DateTime, Utc};
+use itertools::Itertools;
+use serde::{Deserialize, Serialize};
 
 use base64_serde::base64_serde_type;
 
@@ -109,31 +110,44 @@ pub(crate) struct CtLogEntry {
     pub extra_data: Vec<u8>,
 }
 
-static CTL_LISTS: &str = "https://www.gstatic.com/ct/log_list/v3/log_list.json";
+const CTL_LISTS: &str = "https://www.gstatic.com/ct/log_list/v3/log_list.json";
 
 pub(crate) fn get_ctl_logs() -> reqwest::Result<CtLog> {
-    let result = reqwest::blocking::get(CTL_LISTS);
-
-    let response = result?.error_for_status();
-    let resp = response?.json();
-    resp
+    reqwest::blocking::get(CTL_LISTS)?
+        .error_for_status()?
+        .json()
 }
 
-pub(crate) fn retrieve_log_info(base_url: &str, client: &reqwest::blocking::Client) -> reqwest::Result<CtLogInfo> {
+pub(crate) fn retrieve_log_info(
+    base_url: &str,
+    client: &reqwest::blocking::Client,
+) -> reqwest::Result<CtLogInfo> {
     let url = format!("{}ct/v1/get-sth", base_url);
-    let result = client.get(url).send();
-    let response = result?.error_for_status();
-    response?.json()
+    client.get(url).send()?.error_for_status()?.json()
 }
 
-pub(crate) fn find_ct_log<'a>(ct_log: &'a CtLog, filter: &'a str) -> Vec<&'a Log> {
-    let mut ret: Vec<&Log> = vec![];
-    for op in &ct_log.operators {
-        for log in &op.logs {
-            if log.url.starts_with(filter) {
-                ret.push(&log);
+pub(crate) fn find_exactly_one_ct_log<'a>(
+    ct_log: &'a CtLog,
+    filter: &str,
+) -> anyhow::Result<&'a Log> {
+    ct_log
+        .operators
+        .iter()
+        .flat_map(|op| &op.logs)
+        .filter(|log| log.url.starts_with(filter))
+        .exactly_one()
+        .map_err(|e| {
+            // either 0 or 2+
+            let logs = e.collect_vec();
+            if logs.is_empty() {
+                anyhow::anyhow!("No log found for {filter}")
+            } else {
+                match serde_json::to_string_pretty(&logs) {
+                    Ok(pretty_logs) => {
+                        anyhow::anyhow!("Multiple logs found for {filter} - {pretty_logs}")
+                    }
+                    Err(e) => anyhow::anyhow!("Multiple logs found for {filter} - {e}"),
+                }
             }
-        }
-    }
-    ret
+        })
 }

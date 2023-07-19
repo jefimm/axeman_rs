@@ -1,21 +1,9 @@
-use std::process::ExitCode;
-
 use clap::Parser;
 
 use axeman_rs::*;
 
-mod ct_log;
-mod merkle_tree;
-
-fn main() -> ExitCode {
+fn main() -> anyhow::Result<()> {
     env_logger::init();
     let args = Cli::parse();
-    if args.list_mode {
-        handle_list_mode();
-    } else {
-        if !handle_download(&args) {
-            return ExitCode::FAILURE;
-        };
-    }
-    ExitCode::SUCCESS
+    handle_download(&args)
 }
