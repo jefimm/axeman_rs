@@ -130,11 +130,12 @@ pub(crate) fn find_exactly_one_ct_log<'a>(
     ct_log: &'a CtLog,
     filter: &str,
 ) -> anyhow::Result<&'a Log> {
+    let filter_with_https = format!("https://{}", filter);
     ct_log
         .operators
         .iter()
         .flat_map(|op| &op.logs)
-        .filter(|log| log.url.starts_with(filter))
+        .filter(|log| log.url.starts_with(filter) || log.url.starts_with(&filter_with_https))
         .exactly_one()
         .map_err(|e| {
             // either 0 or 2+
