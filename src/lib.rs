@@ -63,7 +63,8 @@ fn download_log(to_retrieve: &Log, args: &Cli) -> anyhow::Result<()> {
     let tree_size = log_info?.tree_size;
 
     if args.ctl_offset > tree_size {
-        bail!("Offset bigger than log size");
+        log::info!("Offset {} bigger than log size {}", args.ctl_offset , tree_size);
+        return Ok(());
     }
     download_log_until(&to_retrieve.url, tree_size, args, &client)?;
     if let Some(save_max_idx_file) = &args.save_max_idx_file {
