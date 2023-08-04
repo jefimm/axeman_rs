@@ -101,6 +101,9 @@ impl ChannelWorker<HandleBlockData> for DownloadWorker {
         let client = &create_http_client();
 
         while let Ok(work) = chan.recv() {
+            if work.end == work.start && work.end == 0 {
+                return;
+            }
             handle_block(client, &work);
         }
     }
@@ -140,6 +143,12 @@ fn download_log_until(
         work_mgr.submit(hbd)?;
         start = end;
     }
+
+    for _ in 0..args.concurrency_count.into(){
+        let hbd = HandleBlockData::new(log_url, 0, 0, &output_dir, args);
+        work_mgr.submit(hbd)?;
+    }
+    log::info!("Waiting for the work to be completed");
     Ok(())
 }
 
