@@ -3,6 +3,7 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use base64_serde::base64_serde_type;
+use crate::download_json_from_url;
 
 base64_serde_type!(Base64Standard, base64::engine::general_purpose::STANDARD);
 
@@ -65,6 +66,10 @@ pub(crate) struct TemporalInterval {
     pub end_exclusive: DateTime<Utc>,
 }
 
+pub(crate) trait IsRateLimited {
+    fn is_rate_limited(&self) -> bool;
+}
+
 // ===========================================
 
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -77,13 +82,19 @@ pub(crate) struct CtLogInfo {
     pub sha256_root_hash: String,
     #[serde(rename = "tree_head_signature")]
     pub tree_head_signature: String,
+    pub error_code: Option<String>,
 }
 
+impl IsRateLimited for CtLogInfo {
+    fn is_rate_limited(&self) -> bool {
+        if let Some(err_code) = &self.error_code {
+            return err_code == "rate_limited";
+        }
+        false
+    }
+}
 // ===========================================
 
-pub(crate) trait IsRateLimited {
-    fn is_rate_limited(&self) -> bool;
-}
 
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -121,9 +132,9 @@ pub(crate) fn get_ctl_logs() -> reqwest::Result<CtLog> {
 pub(crate) fn retrieve_log_info(
     base_url: &str,
     client: &reqwest::blocking::Client,
-) -> reqwest::Result<CtLogInfo> {
+) -> anyhow::Result<CtLogInfo> {
     let url = format!("{}ct/v1/get-sth", base_url);
-    client.get(url).send()?.error_for_status()?.json()
+    download_json_from_url(&url, client)
 }
 
 pub(crate) fn find_exactly_one_ct_log<'a>(
