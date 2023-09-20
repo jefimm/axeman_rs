@@ -43,6 +43,7 @@ pub(crate) struct Log {
 pub(crate) struct State {
     pub usable: Option<Usable>,
     pub retired: Option<Retired>,
+    pub qualified: Option<Qualified>,
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -54,6 +55,12 @@ pub(crate) struct Usable {
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Retired {
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Qualified {
     pub timestamp: DateTime<Utc>,
 }
 
@@ -146,7 +153,9 @@ pub(crate) fn find_exactly_one_ct_log<'a>(
         .operators
         .iter()
         .flat_map(|op| &op.logs)
-        .filter(|log| log.url.starts_with(filter) || log.url.starts_with(&filter_with_https))
+        .filter(|log|
+            (log.state.usable.is_some() || log.state.retired.is_some()) &&
+                (log.url.starts_with(filter) || log.url.starts_with(&filter_with_https)))
         .exactly_one()
         .map_err(|e| {
             // either 0 or 2+
