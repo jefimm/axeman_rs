@@ -154,7 +154,7 @@ pub(crate) fn find_exactly_one_ct_log<'a>(
         .iter()
         .flat_map(|op| &op.logs)
         .filter(|log|
-            (log.state.usable.is_some() || log.state.retired.is_some()) &&
+            (log.state.usable.is_some() || log.state.retired.is_some() || log.state.qualified.is_some()) &&
                 (log.url.starts_with(filter) || log.url.starts_with(&filter_with_https)))
         .exactly_one()
         .map_err(|e| {
