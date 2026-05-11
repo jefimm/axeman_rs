@@ -333,21 +333,24 @@ fn download_json_from_url<T: DeserializeOwned + IsRateLimited>(
                         );
                     }
                 },
-                StatusCode::TOO_MANY_REQUESTS
-                | StatusCode::INTERNAL_SERVER_ERROR
-                | StatusCode::GATEWAY_TIMEOUT
-                | StatusCode::SERVICE_UNAVAILABLE
-                | StatusCode::BAD_GATEWAY => {
-                    let status = response.status();
+                s if matches!(
+                    s,
+                    StatusCode::TOO_MANY_REQUESTS
+                        | StatusCode::INTERNAL_SERVER_ERROR
+                        | StatusCode::GATEWAY_TIMEOUT
+                        | StatusCode::SERVICE_UNAVAILABLE
+                        | StatusCode::BAD_GATEWAY
+                ) || s.as_u16() == 530 =>
+                {
                     log::warn!(
                         "Attempt {}: Url {} got code {} with body {}",
                         attempt,
                         url,
-                        status,
+                        s,
                         &response.text().unwrap()
                     );
                     if attempt == attempt_max {
-                        bail!("max attempt reached {}", status);
+                        bail!("max attempt reached {}", s);
                     }
                 }
                 code => {
