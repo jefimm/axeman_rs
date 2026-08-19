@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::AtomicU64;
 
 use base64_serde::base64_serde_type;
 use crate::download_json_from_url;
@@ -139,9 +140,10 @@ pub(crate) fn get_ctl_logs() -> reqwest::Result<CtLog> {
 pub(crate) fn retrieve_log_info(
     base_url: &str,
     client: &reqwest::blocking::Client,
+    successful_requests: &AtomicU64,
 ) -> anyhow::Result<CtLogInfo> {
     let url = format!("{}ct/v1/get-sth", base_url);
-    download_json_from_url(&url, client)
+    download_json_from_url(&url, client, successful_requests)
 }
 
 pub(crate) fn find_exactly_one_ct_log<'a>(

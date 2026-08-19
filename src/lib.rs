@@ -21,7 +21,12 @@ use std::cmp::min;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::fmt::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::{fs, thread, time};
+
+/// 403 is retried only after this many successful HTTP fetches in the current download.
+const FORBIDDEN_RETRY_SUCCESS_THRESHOLD: u64 = 100;
 
 /// This docstring will appear when you run the cli
 #[derive(Parser, Debug)]
@@ -59,14 +64,21 @@ pub fn handle_download(args: &Cli) -> anyhow::Result<()> {
 
 fn download_log(to_retrieve: &Log, args: &Cli) -> anyhow::Result<()> {
     let client = create_http_client();
-    let log_info = ct_log::retrieve_log_info(&to_retrieve.url, &client);
+    let successful_requests = Arc::new(AtomicU64::new(0));
+    let log_info = ct_log::retrieve_log_info(&to_retrieve.url, &client, &successful_requests);
     let tree_size = log_info?.tree_size;
 
     if args.ctl_offset > tree_size {
         log::info!("Offset {} bigger than log size {}", args.ctl_offset , tree_size);
         return Ok(());
     }
-    download_log_until(&to_retrieve.url, tree_size, args, &client)?;
+    download_log_until(
+        &to_retrieve.url,
+        tree_size,
+        args,
+        &client,
+        Arc::clone(&successful_requests),
+    )?;
     if let Some(save_max_idx_file) = &args.save_max_idx_file {
         write_strings_2_file(&tree_size.to_string(), save_max_idx_file);
     }
@@ -94,8 +106,10 @@ impl HandleBlockData {
     }
 }
 
-#[derive(Default, Debug, Clone)]
-pub(crate) struct DownloadWorker {}
+#[derive(Debug, Clone)]
+pub(crate) struct DownloadWorker {
+    successful_requests: Arc<AtomicU64>,
+}
 
 impl ChannelWorker<HandleBlockData> for DownloadWorker {
     fn run(&self, chan: &Receiver<HandleBlockData>) {
@@ -105,7 +119,7 @@ impl ChannelWorker<HandleBlockData> for DownloadWorker {
             if work.end == work.start && work.end == 0 {
                 return;
             }
-            handle_block(client, &work);
+            handle_block(client, &work, &self.successful_requests);
         }
     }
 }
@@ -115,15 +129,18 @@ fn download_log_until(
     log_size: u64,
     args: &Cli,
     client: &Client,
+    successful_requests: Arc<AtomicU64>,
 ) -> anyhow::Result<()> {
-    let block_size = get_max_block_size(log_url, client)? as u64;
+    let block_size = get_max_block_size(log_url, client, &successful_requests)? as u64;
     let mut start: u64 = (args.ctl_offset / block_size) * block_size;
     let mut dir_index = log_size + 1;
     let mut output_dir = String::new();
     // Instead of having a DownlodWorker struct with no members,
     // I would probably pass the run function to WorkManager
     // It can have the type `impl Fn(&Receiver<HandleBlockData>) -> ()`
-    let worker = DownloadWorker {};
+    let worker = DownloadWorker {
+        successful_requests: Arc::clone(&successful_requests),
+    };
     let mut work_mgr = WorkManager::new(args.concurrency_count.into(), worker);
 
     log::info!(
@@ -153,8 +170,14 @@ fn download_log_until(
     Ok(())
 }
 
-fn handle_block(client: &Client, hbd: &HandleBlockData) {
-    let block = download_ctlog_json(&hbd.log_url, hbd.start, hbd.end, client);
+fn handle_block(client: &Client, hbd: &HandleBlockData, successful_requests: &AtomicU64) {
+    let block = download_ctlog_json(
+        &hbd.log_url,
+        hbd.start,
+        hbd.end,
+        client,
+        successful_requests,
+    );
     process_block(
         &hbd.log_url,
         hbd.start,
@@ -302,14 +325,29 @@ fn download_ctlog_json<T: DeserializeOwned + IsRateLimited>(
     start: u64,
     end: u64,
     client: &Client,
+    successful_requests: &AtomicU64,
 ) -> anyhow::Result<T> {
     let url = format!("{}ct/v1/get-entries?start={}&end={}", base_url, start, end);
-    download_json_from_url(&url, client)
+    download_json_from_url(&url, client, successful_requests)
+}
+
+fn is_retryable_status(status: StatusCode, successful_requests: u64) -> bool {
+    matches!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::GATEWAY_TIMEOUT
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::BAD_GATEWAY
+    ) || status.as_u16() == 530
+        || (status == StatusCode::FORBIDDEN
+            && successful_requests >= FORBIDDEN_RETRY_SUCCESS_THRESHOLD)
 }
 
 fn download_json_from_url<T: DeserializeOwned + IsRateLimited>(
     url: &str,
     client: &Client,
+    successful_requests: &AtomicU64,
 ) -> anyhow::Result<T> {
     let minute = time::Duration::from_secs(60);
     let attempt_max = 30;
@@ -324,6 +362,7 @@ fn download_json_from_url<T: DeserializeOwned + IsRateLimited>(
                     }
                     Ok(json) => {
                         if !json.is_rate_limited() {
+                            successful_requests.fetch_add(1, Ordering::Relaxed);
                             return Ok(json);
                         }
                         log::warn!(
@@ -333,15 +372,7 @@ fn download_json_from_url<T: DeserializeOwned + IsRateLimited>(
                         );
                     }
                 },
-                s if matches!(
-                    s,
-                    StatusCode::TOO_MANY_REQUESTS
-                        | StatusCode::INTERNAL_SERVER_ERROR
-                        | StatusCode::GATEWAY_TIMEOUT
-                        | StatusCode::SERVICE_UNAVAILABLE
-                        | StatusCode::BAD_GATEWAY
-                ) || s.as_u16() == 530 =>
-                {
+                s if is_retryable_status(s, successful_requests.load(Ordering::Relaxed)) => {
                     log::warn!(
                         "Attempt {}: Url {} got code {} with body {}",
                         attempt,
@@ -376,8 +407,12 @@ fn download_json_from_url<T: DeserializeOwned + IsRateLimited>(
     bail!("max attempt reached");
 }
 
-fn get_max_block_size(base_url: &str, client: &reqwest::blocking::Client) -> anyhow::Result<usize> {
-    let chunk: CtLogChunk = download_ctlog_json(base_url, 0, 10000, client)?;
+fn get_max_block_size(
+    base_url: &str,
+    client: &reqwest::blocking::Client,
+    successful_requests: &AtomicU64,
+) -> anyhow::Result<usize> {
+    let chunk: CtLogChunk = download_ctlog_json(base_url, 0, 10000, client, successful_requests)?;
     Ok(chunk.entries.len())
 }
 
@@ -389,6 +424,20 @@ mod tests {
     use std::io::BufReader;
     use std::io::Read;
     use std::path::PathBuf;
+
+    #[test]
+    fn forbidden_is_retryable_after_successful_request_threshold() {
+        assert!(!is_retryable_status(StatusCode::FORBIDDEN, 0));
+        assert!(!is_retryable_status(
+            StatusCode::FORBIDDEN,
+            FORBIDDEN_RETRY_SUCCESS_THRESHOLD - 1
+        ));
+        assert!(is_retryable_status(
+            StatusCode::FORBIDDEN,
+            FORBIDDEN_RETRY_SUCCESS_THRESHOLD
+        ));
+        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS, 0));
+    }
 
     #[test]
     fn test_cert_parse() {
