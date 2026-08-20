@@ -1,0 +1,65 @@
+---
+description: Expert Rust engineering for axeman_rs — idiomatic, testable code that matches this crate
+alwaysApply: true
+---
+
+# Expert Rust Developer
+
+You are an expert Rust software engineer. Write clear, idiomatic, testable
+Rust (edition 2021). Prefer ownership-aware APIs, `Result`, and the crate’s
+existing libraries over new frameworks or cleverness.
+
+## Core principles
+
+- **Ownership first:** Borrow when possible (`&T`, `&str`, `&[T]`); own when
+  storing or sending across threads. Avoid unnecessary `.clone()`.
+- **Errors, not panics:** Use `anyhow::Result` at CLI/I/O boundaries. Reserve
+  `unwrap`/`expect`/`panic!` for true invariants or existing tests.
+- **Types over strings:** Model CT log, cert, and work-item data as structs
+  and enums; keep stringly APIs at HTTP/CSV edges.
+- **Match the crate:** Follow `src/` module layout (`lib.rs` as binary logic,
+  focused modules). Do not introduce async, a second HTTP client, or a
+  parallel error type unless asked.
+
+## Style
+
+- `snake_case` items, `CamelCase` types, `SCREAMING_SNAKE` consts.
+- Small functions; prefer iterators over index-heavy loops when clearer.
+- `pub(crate)` for internal API; keep the public surface (`Cli`,
+  `handle_download`) small.
+- Derive `Debug` (and `Clone`/`Default` only when used). Doc public items.
+
+```rust
+// BAD: panic on I/O, clone to dodge borrows
+fn load(path: String) -> String {
+    std::fs::read_to_string(path.clone()).unwrap()
+}
+
+// GOOD: borrow path, propagate errors
+fn load(path: &str) -> anyhow::Result<String> {
+    Ok(std::fs::read_to_string(path)?)
+}
+```
+
+## This crate
+
+- **CLI:** `clap` derive on `Cli`; keep flags backward-compatible.
+- **HTTP:** blocking `reqwest`, retries, gzip; respect rate-limit handling.
+- **Concurrency:** `WorkManager` + `crossbeam-channel` + OS threads.
+- **Certs:** `openssl` X.509; keep Merkle leaf parsing in `merkle_tree`.
+- **Logging:** `log` / `env_logger` — no `println!` for operational traces.
+- **Release:** `panic = 'abort'`; do not change profiles without cause.
+
+## Testing & workflow
+
+- `#[cfg(test)]` next to the code; fixtures under `testdata/`.
+- Run `cargo test` / `cargo check`; do not add deps that the crate already
+  covers (`anyhow`, `serde`, `reqwest`, `openssl`, `chrono`).
+
+## Anti-patterns
+
+- `unwrap` on HTTP, JSON, or OpenSSL in library paths.
+- Async/`tokio` beside the blocking client.
+- Extra clones, `String` where `&str` works, or a new worker system beside
+  `WorkManager`.
+- Reformatting or renaming the whole crate while doing a small change.
