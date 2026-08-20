@@ -10,7 +10,6 @@ use anyhow::bail;
 use base64::Engine;
 use chrono::DateTime;
 use clap::Parser;
-use crossbeam_channel::Receiver;
 use openssl::asn1::Asn1TimeRef;
 use openssl::x509::X509;
 use reqwest::blocking::Client;
@@ -80,7 +79,7 @@ fn download_log(to_retrieve: &Log, args: &Cli) -> anyhow::Result<()> {
         Arc::clone(&successful_requests),
     )?;
     if let Some(save_max_idx_file) = &args.save_max_idx_file {
-        write_strings_2_file(&tree_size.to_string(), save_max_idx_file);
+        write_strings_2_file(&tree_size.to_string(), save_max_idx_file)?;
     }
     Ok(())
 }
@@ -109,18 +108,12 @@ impl HandleBlockData {
 #[derive(Debug, Clone)]
 pub(crate) struct DownloadWorker {
     successful_requests: Arc<AtomicU64>,
+    client: Client,
 }
 
 impl ChannelWorker<HandleBlockData> for DownloadWorker {
-    fn run(&self, chan: &Receiver<HandleBlockData>) {
-        let client = &create_http_client();
-
-        while let Ok(work) = chan.recv() {
-            if work.end == work.start && work.end == 0 {
-                return;
-            }
-            handle_block(client, &work, &self.successful_requests);
-        }
+    fn handle(&self, work: HandleBlockData) -> anyhow::Result<()> {
+        handle_block(&self.client, &work, &self.successful_requests)
     }
 }
 
@@ -140,6 +133,7 @@ fn download_log_until(
     // It can have the type `impl Fn(&Receiver<HandleBlockData>) -> ()`
     let worker = DownloadWorker {
         successful_requests: Arc::clone(&successful_requests),
+        client: create_http_client(),
     };
     let mut work_mgr = WorkManager::new(args.concurrency_count.into(), worker);
 
@@ -151,6 +145,9 @@ fn download_log_until(
         concurrency_count = args.concurrency_count
     );
     while start < log_size {
+        if work_mgr.is_stopped() {
+            break;
+        }
         let current_dir_index = start / 1000000;
         if dir_index != current_dir_index {
             dir_index = current_dir_index;
@@ -158,34 +155,36 @@ fn download_log_until(
         }
         let end = start + block_size;
         let hbd = HandleBlockData::new(log_url, start, end, &output_dir, args);
-        work_mgr.submit(hbd)?;
+        if work_mgr.submit(hbd).is_err() {
+            break;
+        }
         start = end;
     }
 
-    for _ in 0..args.concurrency_count.into(){
-        let hbd = HandleBlockData::new(log_url, 0, 0, &output_dir, args);
-        work_mgr.submit(hbd)?;
-    }
-    log::info!("Waiting for the work to be completed");
-    Ok(())
+    log::info!("Waiting for in-flight work to be completed");
+    work_mgr.join()
 }
 
-fn handle_block(client: &Client, hbd: &HandleBlockData, successful_requests: &AtomicU64) {
+fn handle_block(
+    client: &Client,
+    hbd: &HandleBlockData,
+    successful_requests: &AtomicU64,
+) -> anyhow::Result<()> {
     let block = download_ctlog_json(
         &hbd.log_url,
         hbd.start,
         hbd.end,
         client,
         successful_requests,
-    );
+    )?;
     process_block(
         &hbd.log_url,
         hbd.start,
         hbd.end,
         &hbd.output_dir,
-        &block.unwrap(),
+        &block,
         &hbd.filter_domains,
-    );
+    )
 }
 
 fn process_block(
@@ -195,9 +194,9 @@ fn process_block(
     output_dir: &str,
     chunk: &CtLogChunk,
     filter_domains: &[String],
-) {
+) -> anyhow::Result<()> {
     if chunk.entries.is_empty() {
-        panic!("{} {}-{} returned empty data", log_url, start, end);
+        bail!("{} {}-{} returned empty data", log_url, start, end);
     }
     let mut idx = start;
     // collect on an iterator of strings joins them to a single string
@@ -211,11 +210,11 @@ fn process_block(
         })
         .collect();
     if file_content.is_empty() {
-        return;
+        return Ok(());
     }
     let csv_file = format!("{}/{}-{}.csv", output_dir, start, idx - 1);
 
-    write_strings_2_file(&file_content, &csv_file);
+    write_strings_2_file(&file_content, &csv_file)
 }
 
 fn to_csv_string(
@@ -224,16 +223,29 @@ fn to_csv_string(
     entry: &CtLogEntry,
     filter_domains: &[String],
 ) -> Option<String> {
-    let leaf_cert = merkle_tree::get_leaf_from_merkle_tree(&entry.leaf_input, &entry.extra_data);
+    let leaf_cert = match merkle_tree::get_leaf_from_merkle_tree(&entry.leaf_input, &entry.extra_data)
+    {
+        Ok(cert) => cert,
+        Err(e) => {
+            log::warn!("Skipping CT entry {idx}: {e:#}");
+            return None;
+        }
+    };
     let domains = get_cert_domains(&leaf_cert);
     if is_filtered(&domains, filter_domains) {
         return None;
     }
 
     // let sha256 = chain_sha2456(entry.leaf_input.len() + entry.extra_data.len(), &chain[1..]);
-    let not_before = get_cert_not_before(&leaf_cert);
-    let not_after = get_cert_not_after(&leaf_cert);
-    let as_der = base64::engine::general_purpose::STANDARD.encode(leaf_cert.to_der().unwrap());
+    let not_before = get_cert_not_before(&leaf_cert)?;
+    let not_after = get_cert_not_after(&leaf_cert)?;
+    let as_der = match leaf_cert.to_der() {
+        Ok(der) => base64::engine::general_purpose::STANDARD.encode(der),
+        Err(e) => {
+            log::warn!("Skipping CT entry {idx}: failed to encode DER: {e}");
+            return None;
+        }
+    };
     let log_with_last_char = log_url.trim_end_matches('/');
     Some(format!(
         "{},{},hash,{},{},{}.0,{}.0\n",
@@ -253,9 +265,10 @@ fn get_cert_domains(cert: &X509) -> Vec<String> {
     for cn in sn.entries() {
         let nid = &cn.object().nid();
         if nid.as_raw() == openssl::nid::Nid::COMMONNAME.as_raw() {
-            let os = cn.data().as_utf8().unwrap();
-            let s: &str = os.as_ref();
-            ret.insert(s.to_string());
+            if let Ok(os) = cn.data().as_utf8() {
+                let s: &str = os.as_ref();
+                ret.insert(s.to_string());
+            }
         }
     }
     if let Some(sanr) = &cert.subject_alt_names() {
@@ -268,22 +281,24 @@ fn get_cert_domains(cert: &X509) -> Vec<String> {
     Vec::from_iter(ret)
 }
 
-fn get_cert_not_before(cert: &X509) -> i64 {
-    let not_before = &cert.not_before();
-    asn_time_ref2ts(not_before)
+fn get_cert_not_before(cert: &X509) -> Option<i64> {
+    asn_time_ref2ts(cert.not_before())
 }
 
-fn get_cert_not_after(cert: &X509) -> i64 {
-    let not_after = &cert.not_after();
-    asn_time_ref2ts(not_after)
+fn get_cert_not_after(cert: &X509) -> Option<i64> {
+    asn_time_ref2ts(cert.not_after())
 }
 
-fn asn_time_ref2ts(not_before: &&Asn1TimeRef) -> i64 {
+fn asn_time_ref2ts(not_before: &Asn1TimeRef) -> Option<i64> {
     let mut date_str = String::with_capacity(25);
-    write!(date_str, "{}", not_before).unwrap();
+    write!(date_str, "{}", not_before).ok()?;
+    if date_str.len() < 3 {
+        return None;
+    }
     date_str = String::from(&date_str[..date_str.len() - 3]) + "+00:00";
-    let datetime = DateTime::parse_from_str(&date_str, "%b %d %T %Y %z").unwrap();
-    datetime.timestamp()
+    DateTime::parse_from_str(&date_str, "%b %d %T %Y %z")
+        .ok()
+        .map(|datetime| datetime.timestamp())
 }
 
 fn create_http_client() -> Client {
@@ -449,7 +464,7 @@ mod tests {
         let cert = &X509::from_der(&der_data).unwrap();
         let domains = get_cert_domains(cert);
         assert_eq!(domains.first().unwrap(), "www.google.com");
-        let not_before = get_cert_not_before(cert);
+        let not_before = get_cert_not_before(cert).unwrap();
         assert_eq!(not_before, 1682337676);
     }
 }
